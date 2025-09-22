@@ -67,44 +67,43 @@ class PDOMonitor:
         """将扭矩计数转换为牛顿米"""
         return counts * TORQUE_CONSTANT / CURRENT_SCALE
 
-    def _pdo_callback(self, message):
+    def _pdo_callback(self, can_id,data,timestamp):
         """处理接收到的PDO消息"""
-        can_id = message.arbitration_id
-        data = message.data
+        # can_id = message.arbitration_id
+        # data = message.data
 
-        if can_id == 0x180 + self.node_id:  # TPDO1: 状态字、位置、扭矩
+        if can_id == 0x180 + self.node_id:  # TPDO1: 位置和速度反馈
             if len(data) >= 8:
-                # 解析状态字 (小端序uint16)
-                status = int.from_bytes(data[0:2], byteorder='little')
-                # 解析位置 (小端序int32)
-                position = int.from_bytes(data[2:6], byteorder='little', signed=True)
-                # 解析扭矩 (小端序int16)
-                torque = int.from_bytes(data[6:8], byteorder='little', signed=True)
-
-                # 更新状态
-                self.motor_state.status = status
-                self.motor_state.position = self.counts_to_radians(position)
-                self.motor_state.torque = self.counts_to_newton_meters(torque)
-
-                with self.print_lock:
-                    print(f"[TPDO1] Status: 0x{status:04X} "
-                          f"Pos: {self.motor_state.position:.4f} rad "
-                          f"Torque: {self.motor_state.torque:.3f} Nm")
-
-        elif can_id == 0x280 + self.node_id:  # TPDO2: 位置和速度
-            if len(data) >= 8:
-                # 解析位置 (小端序int32)
+                # 解析位置 (小端序 int32)
                 position = int.from_bytes(data[0:4], byteorder='little', signed=True)
-                # 解析速度 (小端序int32)
+
+                # 解析速度 (小端序 int32)
                 velocity = int.from_bytes(data[4:8], byteorder='little', signed=True)
 
-                # 更新状态
-                self.motor_state.position = self.counts_to_radians(position)
-                self.motor_state.velocity = self.counts_to_rad_per_sec(velocity)
+                # 转换为工程单位
+                pos_rad = self.counts_to_radians(position)
+                vel_rad_s = self.counts_to_rad_per_sec(velocity)
 
                 with self.print_lock:
-                    print(f"[TPDO2] Pos: {self.motor_state.position:.4f} rad "
-                          f"Vel: {self.motor_state.velocity:.2f} rad/s")
+                    print(f"[TPDO1] Motor ID:0x{can_id - 0x180:X} "
+                          f"Pos: {pos_rad:.4f} rad ({position} counts) "
+                          f"Vel: {vel_rad_s:.2f} rad/s")
+
+        elif can_id == 0x280 + self.node_id:  # TPDO2: 扭矩、状态字和错误码
+            if len(data) >= 6:
+                # 解析扭矩 (小端序int16)
+                torque = int.from_bytes(data[0:2], byteorder='little', signed=True)
+                # 解析状态字 (小端序uint16)
+                status = int.from_bytes(data[2:4], byteorder='little', signed=False)
+                # 解析错误码 (小端序uint16)
+                error = int.from_bytes(data[4:6], byteorder='little', signed=False)
+                # 转换为工程单位
+                torque_nm = self.counts_to_newton_meters(torque)
+                with self.print_lock:
+                    print(f"[TPDO2] Motor ID:0x{can_id - 0x280:X} "      
+                          f"Torque: {torque_nm:.3f} Nm ({torque} counts) "      
+                          f"Status: 0x{status:04X} "      
+                          f"Error: 0x{error:04X}")
 
     def configure_tpdo(self, node_id=1, auto_report_ms=10):
         """根据YiyouServo EDS文件的TPDO配置"""
@@ -112,7 +111,7 @@ class PDOMonitor:
             self.node = self.network[node_id]
             for index in range(4):  # TPDO0到TPDO3（即TPDO1到TPDO4）
                 # 1. 禁用TPDO (设置COB-ID最高位)
-                cob_id = 0x180 + index * 0x100 + node_id  # 不设置禁止位
+                cob_id = (0x80 << 24) + 0x180 + index * 0x100 + node_id  # 不设置禁止位
                 self.node.sdo[0x1800 + index][1].raw = cob_id  # 0x1800:TPDO1, 0x1801:TPDO2...
 
                 # 2. 清空映射
@@ -123,41 +122,42 @@ class PDOMonitor:
                 self.node.sdo[0x1800 + index][3].raw = 0  # Inhibit Time
                 self.node.sdo[0x1800 + index][5].raw = auto_report_ms  # Event Timer
 
+                # self.node.sdo[0x1800 + index][6].raw = 0  # Event Timer
                 print(f"TPDO{index + 1} 基础参数已配置: COB-ID=0x{cob_id:08X}")
                 # 设置映射参数 (根据EDS文件中的默认映射)
                 # ===== TPDO1配置 (COB-ID: 0x180 + node_id) =====
                 # 映射对象1: 实际位置(0x6064:0, 32bit)
-                self.node.sdo[0x1A00][1].raw = (0x6064 << 16) | 0x20  # 等效于 (0x6064 << 16) + 0x20
-                # 映射对象2: 实际速度(0x606C:0, 32bit)
-                self.node.sdo[0x1A00][2].raw = (0x606C << 16) | 0x20
-                # 设置映射数量
+            self.node.sdo[0x1A00][1].raw = (0x6064 << 16) | 0x20  # 等效于 (0x6064 << 16) + 0x20
+                # # 映射对象2: 实际速度(0x606C:0, 32bit)
+            self.node.sdo[0x1A00][2].raw = (0x606C << 16) | 0x20
+            self.node.sdo[0x1A00][0].raw = 2  # 2个映射对象 (共8字节)
+                # # # 设置映射数量
+                # #
+                # #
+                # # # ===== TPDO2配置 (COB-ID: 0x280 + node_id) =====
+                # # 映射对象1: 实际扭矩(0x6077:0, 16bit)
+            self.node.sdo[0x1A01][1].raw = (0x6077 << 16) | 0x10
+                # # 映射对象2: 状态字(0x6041:0, 16bit)
+            self.node.sdo[0x1A01][2].raw = (0x6041 << 16) | 0x10
+                # # 映射对象3: 错误码(0x603F:0, 16bit)
+            self.node.sdo[0x1A01][3].raw = (0x603F << 16) | 0x10
+                # # 设置映射数量 (注意：3个16bit对象=6字节，未超8字节限制)
+            self.node.sdo[0x1A01][0].raw = 3
+                # #
+                # # # 激活TPDO
+            self.node.sdo[0x1800][1].raw = 0x180 + node_id
+            self.node.sdo[0x1801][1].raw = 0x280 + node_id
+                #
+                # # ===== 3. 重启节点应用配置 =====
+            self.node.nmt.state = 'RESET'
+            time.sleep(0.1)
+            self.node.nmt.state = 'OPERATIONAL'
+            time.sleep(0.1)
 
-
-                # ===== TPDO2配置 (COB-ID: 0x280 + node_id) =====
-                # 映射对象1: 实际扭矩(0x6077:0, 16bit)
-                self.node.sdo[0x1A01][1].raw = (0x6077 << 16) | 0x10
-                # 映射对象2: 状态字(0x6041:0, 16bit)
-                self.node.sdo[0x1A01][2].raw = (0x6041 << 16) | 0x10
-                # 映射对象3: 错误码(0x603F:0, 16bit)
-                self.node.sdo[0x1A01][3].raw = (0x603F << 16) | 0x10
-                # 设置映射数量 (注意：3个16bit对象=6字节，未超8字节限制)
-                self.node.sdo[0x1A00][0].raw = 2  # 2个映射对象 (共8字节)
-                self.node.sdo[0x1A01][0].raw = 3
-
-                # 激活TPDO
-                self.node.sdo[0x1800][1].raw = 0x180 + node_id
-                self.node.sdo[0x1801][1].raw = 0x280 + node_id
-
-                # ===== 3. 重启节点应用配置 =====
-                self.node.nmt.state = 'RESET'
-                time.sleep(0.1)
-                self.node.nmt.state = 'OPERATIONAL'
-                time.sleep(0.5)
-
-                print(f"节点{node_id} TPDO配置成功:")
-                print(f"  TPDO1 (0x{0x180 + node_id:03X}): 状态字 + 位置需求 + 扭矩实际")
-                print(f"  TPDO2 (0x{0x280 + node_id:03X}): 位置实际 + 速度实际")
-                return True
+            print(f"节点{node_id} TPDO配置成功:")
+            print(f"  TPDO1 (0x{0x180 + node_id:03X}): 状态字 + 位置需求 + 扭矩实际")
+            print(f"  TPDO2 (0x{0x280 + node_id:03X}): 位置实际 + 速度实际")
+            return True
 
         except Exception as e:
             print(f"TPDO配置失败: {str(e)}")
