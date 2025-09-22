@@ -77,12 +77,12 @@ class CANopenMonitor:
         test_data = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
         while self.is_running:
             # # 发送测试数据
-            # self.send_data(0x701, test_data)
-            #
-            # # 读取SDO数据示例
-            # value = self.read_sdo(0x2002)
-            # if value is not None:
-            #     print(f"SDO 0x2002 value: {value}")
+            self.send_data(0x701, test_data)
+
+            # 读取SDO数据示例
+            value = self.read_sdo(0x2002)
+            if value is not None:
+                print(f"SDO 0x2002 value: {value}")
 
             time.sleep(0.01)
 

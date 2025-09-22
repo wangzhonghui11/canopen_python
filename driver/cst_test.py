@@ -1,123 +1,195 @@
 import time
 import canopen
-import threading
+from threading import Lock, Thread
 import signal
 import sys
-from dataclasses import dataclass
 
 
-@dataclass
-class TorqueProfile:
-    target_torque: int = 300  # 目标力矩值
-    slope: int = 300  # 力矩斜率
-    is_update: bool = False  # 是否采用更新模式
-
-
-class HarmonicTorqueController:
-    def __init__(self, node_id=1, eds_path='YiyouServo.eds', channel='can0', bitrate=1000000):
+class HarmonicServoDriver:
+    def __init__(self, node_id=1, channel='can0', bitrate=1000000,eds_path='YiyouServo.eds'):
         self.node_id = node_id
         self.network = canopen.Network()
-        self.running = True
-        self.print_lock = threading.Lock()
-
-        # 添加节点
-        self.node = canopen.RemoteNode(node_id, eds_path)
-        self.network.add_node(self.node)
-
-        # 连接CAN总线
-        self.network.connect(bustype='socketcan', channel=channel, bitrate=bitrate)
+        self.print_lock = Lock()
+        self.is_running = True
+        self.current_torque = 0
+        self.target_torque = 0
+        self.is_sync = True
+        self.itpv = 4  # 插补周期，单位ms
 
         # 信号处理
-        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGINT, self.signal_handler)
 
-    def _signal_handler(self, sig, frame):
-        print("\nShutting down...")
-        self.running = False
-        self.network.disconnect()
+        try:
+            # 连接CAN总线
+            self.network.connect(
+                bustype='socketcan',
+                channel=channel,
+                bitrate=bitrate
+            )
+
+            # 添加节点
+            self.node = canopen.RemoteNode(node_id, eds_path)
+            self.network.add_node(self.node)
+
+            print(f"Harmonic伺服驱动器初始化成功，节点ID: {node_id}")
+
+        except Exception as e:
+            print(f"初始化失败: {e}")
+            self.cleanup()
+            raise
+
+    def signal_handler(self, sig, frame):
+        """处理中断信号"""
+        print("\n接收到中断信号，正在安全关闭...")
+        self.is_running = False
+        self.cleanup()
         sys.exit(0)
 
-    def setup_torque_mode(self, profile: TorqueProfile):
-        """配置轮廓力矩模式"""
+    def print_message(self, is_tx, can_id, data):
+        """打印CAN消息"""
+        with self.print_lock:
+            direction = "TX" if is_tx else "RX"
+            hex_data = ' '.join(f"{byte:02x}" for byte in data)
+            print(f"[{direction} 0x{can_id:03X}] {hex_data}")
+
+    def configure_cyclic_sync_torque_mode(self):
+        """配置循环同步力矩模式"""
         try:
-            # 设置操作模式为轮廓力矩模式 (对象字典0x6060)
-            self.node.sdo[0x6060].raw = 4  # 4 = Profile Torque Mode
+            print("配置循环同步力矩模式...")
 
-            # 设置同步计数器 (对象字典0x1019)
-            self.node.sdo[0x1019].raw = 0  # 单变量访问方式
+            # 1. 设置操作模式为循环同步力矩模式 (0x6060 = 10)
+            self.node.sdo[0x6060].raw = 10  # 1 = Profile Position Mode
+            print("  操作模式设置为循环同步力矩模式 (0x6060 = 10)")
 
-            # 设置力矩斜率 (对象字典0x6087)
-            self.node.sdo[0x6087].raw = profile.slope
+            # 2. 设置插补时间周期 (0x60C2sub1)
+            self.node.sdo[0x60C2][1].raw = self.itpv
+            print(f"  插补时间周期设置为 {self.itpv}ms (0x60C2sub1)")
+            self.node.sdo[0x1019].raw = 0
+            # 3. 配置RPDO1映射 (目标力矩)
+            self.node.sdo[0x1400][1].raw = (0x80 << 24) + 0x200 +  + self.node_id  # COB-ID (带禁止位)
+            self.node.sdo[0x1600][0].raw = 0  # 映射条目数
+            self.node.sdo[0x1400][2].raw = 0xFF if not self.is_sync else 0x01  # 传输类型
 
-            # 状态转换序列 (通过控制字0x6040)
-            self.node.sdo[0x6040].raw = 0x06  # 准备启动
-            self.node.sdo[0x6040].raw = 0x07  # 切换到"Operation Enabled"
+            self.node.sdo[0x1600][1].raw =  (0x6071 << 16) + 0x10 # 目标力矩(0x6071:00, 16bit)
+            self.node.sdo[0x1600][0].raw = 1  # 映射条目数
+            # 4. 重置节点应用配置
+            self.node.nmt.state = 'RESET'
+            print("  节点重置")
+            time.sleep(0.05)
 
+            self.node.nmt.state = 'OPERATIONAL'
+            print("  节点启动")
+            time.sleep(0.05)
+
+            # 5. 重新配置RPDO1 COB-ID（移除禁止位）
+            self.node.sdo[0x1400][1].raw = 0x200 + self.node_id  # COB-ID
+            print("  RPDO1 COB-ID重新设置为 0x%03X" % (0x200 + self.node_id))
+
+            # # 6. 状态转换序列
+            control_words = [
+                (0x06, "准备启用"),
+                (0x07, "启用"),
+                (0x0F, "开始运动")
+            ]
+
+            for value, description in control_words:
+                self.node.sdo[0x6040].raw = value
+                print(f"  控制字: 0x{value:04X} - {description}")
+                time.sleep(0.05)
+
+            # 7. 获取当前力矩
+            self.current_torque = self.node.sdo[0x6077].raw
+            print(f"  当前力矩: {self.current_torque}")
+
+            print("循环同步力矩模式配置完成")
             return True
+
         except Exception as e:
-            print(f"[error] Setup failed: {e}")
+            print(f"配置失败: {e}")
             return False
 
-    def set_torque(self, torque_value):
+    def set_torque(self, torque):
         """设置目标力矩"""
         try:
-            # 设置目标力矩 (对象字典0x6071)
-            self.node.sdo[0x6071].raw = torque_value
+            # 使用RPDO发送目标力矩
+            data = torque.to_bytes(2, byteorder='little', signed=True)
+            self.network.send_message(0x200 + self.node_id, data)
+            self.print_message(True, 0x200 + self.node_id, data)
 
-            # 激活力矩控制 (控制字0x6040)
-            self.node.sdo[0x6040].raw = 0x0F
-
-            with self.print_lock:
-                print(f"[test] Torque set to {torque_value}")
+            # 如果需要同步，发送同步帧
+            if self.is_sync:
+                self.network.send_message(0x80, bytes([0]))
+                self.print_message(True, 0x80, bytes([0]))
 
             return True
         except Exception as e:
-            print(f"[error] Torque set failed: {e}")
+            print(f"设置力矩失败: {e}")
             return False
+
+    def run_torque_control(self, start_torque=0, step=1, max_torque=1000):
+        """运行力矩控制循环"""
+        if not self.configure_cyclic_sync_torque_mode():
+            return
+
+        try:
+            torque = start_torque
+            while self.is_running:
+                if not self.set_torque(torque):
+                    break
+
+                print(f"目标力矩: {torque}")
+
+                # 更新力矩值
+                torque += step
+                if torque > max_torque:
+                    torque = max_torque
+
+                # 按插补周期等待
+                time.sleep(self.itpv / 1000)
+
+        finally:
+            self.stop_control()
 
     def stop_control(self):
         """停止控制"""
         try:
-            self.node.sdo[0x6040].raw = 0x06  # 切换到"Ready to switch on"
-            self.node.sdo[0x6040].raw = 0x00  # 禁用
+            self.node.sdo[0x6040].raw = 0x06  # 回到准备启用状态
+            print("控制已停止")
         except Exception as e:
-            print(f"[error] Stop failed: {e}")
+            print(f"停止控制失败: {e}")
 
-    def run_torque_test(self, profile: TorqueProfile):
-        """运行力矩控制测试"""
-        if not self.setup_torque_mode(profile):
-            return False
-
-        toggle_torque = False
-        while self.running:
-            # 在300和0之间切换力矩值
-            target = 300 if not toggle_torque else 0
-            if not self.set_torque(target):
-                break
-
-            toggle_torque = not toggle_torque
-
-            # 等待周期（简化版，实际应该检查状态字）
-            for _ in range(100):
-                if not self.running:
-                    break
-                time.sleep(0.05)
-
-        self.stop_control()
+    def cleanup(self):
+        """清理资源"""
+        try:
+            if hasattr(self, 'node'):
+                self.stop_control()
+            if hasattr(self, 'network'):
+                self.network.disconnect()
+            print("资源已安全释放")
+        except Exception as e:
+            print(f"清理过程中出错: {e}")
 
 
+# 使用示例
 if __name__ == "__main__":
-    # 创建力矩配置文件
-    torque_profile = TorqueProfile(
-        target_torque=300,
-        slope=300
-    )
-
-    # 初始化控制器
-    controller = HarmonicTorqueController(node_id=1, eds_path='../eds/YiyouServo.eds')
-
     try:
-        # 运行测试
-        controller.run_torque_test(torque_profile)
-    except KeyboardInterrupt:
-        controller.stop_control()
-        controller.network.disconnect()
+        # 创建伺服驱动器实例
+        servo = HarmonicServoDriver(
+            node_id=1,
+            channel='can0',
+            bitrate=1000000,
+            eds_path='../eds/YiyouServo.eds'
+        )
+
+        # 运行力矩控制
+        servo.run_torque_control(
+            start_torque=0,
+            step=1,
+            max_torque=100
+        )
+
+    except Exception as e:
+        print(f"程序异常: {e}")
+    finally:
+        if 'servo' in locals():
+            servo.cleanup()
